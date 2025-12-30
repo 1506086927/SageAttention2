@@ -18,6 +18,40 @@ import torch, math
 import triton
 import triton.language as tl
 
+
+import functools
+@functools.lru_cache(maxsize=None)
+def get_optimal_num_stages(device_idx, head_dim, block_m=64, block_n=64):
+
+    default_stages = 4 if head_dim > 64 else 3
+    
+
+    props = torch.cuda.get_device_properties(device_idx)
+    sm_major = props.major
+    
+    if sm_major < 8:
+        return default_stages
+
+
+    stage_size_bytes = (block_m * head_dim) + (block_n * head_dim) + (block_n * head_dim * 2)
+    
+
+    if hasattr(props, 'max_shared_memory_per_block_optin'):
+        max_smem = props.max_shared_memory_per_block_optin
+    else:
+
+        if sm_major == 8 and props.minor >= 6: 
+            max_smem = 102400 
+        else:
+            max_smem = 163840 # Default generous estimate for A100+
+
+    max_stages = (max_smem - 4096) // stage_size_bytes
+    
+
+    return max(2, min(default_stages, int(max_stages)))
+
+
+
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len,
                     K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn, 
@@ -159,7 +193,9 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", output_dtype=torch.f
     else:
         lse = torch.empty([0], dtype=torch.float32, device='cpu')
 
-    grid = (triton.cdiv(qo_len, BLOCK_M), h_qo, b   )
+    dynamic_stages = get_optimal_num_stages(q.device.index, head_dim, BLOCK_M, BLOCK_N)
+
+    grid = (triton.cdiv(qo_len, BLOCK_M), h_qo, b)
     _attn_fwd[grid](
         q, k, v, q_scale, k_scale, o, lse,
         stride_bz_q, stride_h_q, stride_seq_q, 
@@ -172,6 +208,6 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", output_dtype=torch.f
         STAGE=stage,  
         RETURN_LSE=return_lse,
         num_warps=4 if head_dim == 64 else 8,
-        num_stages=4)
+        num_stages=dynamic_stages)
 
     return o, lse
