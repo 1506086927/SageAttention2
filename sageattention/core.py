@@ -109,13 +109,12 @@ def sageattn(
     if arch == "sm90" and return_lse:
         raise NotImplementedError("return_lse is not supported on SM90.")
 
-    # Prevent triple type conversion on SM75 (BF16 -> FP16 directly)
-    bf16_input = False
-    if is_sm75 and q.dtype == torch.bfloat16:
+    # Prevent triple type conversion on SM75 (BF16/FP32 -> FP16 directly)
+    orig_dtype = q.dtype
+    if is_sm75 and q.dtype in [torch.bfloat16, torch.float32]:
         q = q.to(torch.float16)
         k = k.to(torch.float16)
         v = v.to(torch.float16)
-        bf16_input = True
 
     seq_len = q.size(2) if tensor_layout == "HND" else q.size(1)
     
@@ -133,8 +132,8 @@ def sageattn(
                 )
                 if return_lse:
                     o, lse = result
-                    return (o.to(torch.bfloat16) if bf16_input else o), lse
-                return result.to(torch.bfloat16) if bf16_input else result
+                    return o.to(orig_dtype), lse
+                return result.to(orig_dtype)
             else:
                 is_nhd = (tensor_layout == "NHD")
                 
@@ -156,9 +155,7 @@ def sageattn(
                 if is_nhd:
                     result = result.transpose(1, 2)
                 
-                if bf16_input:
-                    return result.to(torch.bfloat16)
-                return result
+                return result.to(orig_dtype)
         else:
             return sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32")
     elif arch == "sm80":
@@ -209,7 +206,11 @@ def sageattn_qk_int8_pv_fp16_triton(
         q = torch.nn.functional.pad(q, (0, 128 - head_dim_og))
         k = torch.nn.functional.pad(k, (0, 128 - head_dim_og))
         v = torch.nn.functional.pad(v, (0, 128 - head_dim_og))
-    elif head_dim_og > 128:
+    elif head_dim_og > 128 and head_dim_og <= 256:
+        q = torch.nn.functional.pad(q, (0, 256 - head_dim_og))
+        k = torch.nn.functional.pad(k, (0, 256 - head_dim_og))
+        v = torch.nn.functional.pad(v, (0, 256 - head_dim_og))
+    elif head_dim_og > 256:
         raise ValueError(f"Unsupported head_dim: {head_dim_og}")
 
     seq_dim = 1 if tensor_layout == "NHD" else 2
@@ -281,7 +282,11 @@ def sageattn_varlen(
         q = torch.nn.functional.pad(q, (0, 128 - head_dim_og))
         k = torch.nn.functional.pad(k, (0, 128 - head_dim_og))
         v = torch.nn.functional.pad(v, (0, 128 - head_dim_og))
-    elif head_dim_og > 128:
+    elif head_dim_og > 128 and head_dim_og <= 256:
+        q = torch.nn.functional.pad(q, (0, 256 - head_dim_og))
+        k = torch.nn.functional.pad(k, (0, 256 - head_dim_og))
+        v = torch.nn.functional.pad(v, (0, 256 - head_dim_og))
+    elif head_dim_og > 256:
         raise ValueError(f"Unsupported head_dim: {head_dim_og}")
 
     assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, "Last dim of qkv must be contiguous."
@@ -366,7 +371,7 @@ def sageattn_qk_int8_pv_fp16_cuda(
     if is_sm75 and qk_quant_gran == "per_block":
         qk_quant_gran = "per_warp"
 
-    if is_sm75 and q.dtype == torch.bfloat16:
+    if is_sm75 and q.dtype in [torch.bfloat16, torch.float32]:
         q = q.to(torch.float16)
         k = k.to(torch.float16)
         v = v.to(torch.float16)
@@ -390,7 +395,11 @@ def sageattn_qk_int8_pv_fp16_cuda(
         q = torch.nn.functional.pad(q, (0, 128 - head_dim_og))
         k = torch.nn.functional.pad(k, (0, 128 - head_dim_og))
         v = torch.nn.functional.pad(v, (0, 128 - head_dim_og))
-    elif head_dim_og > 128:
+    elif head_dim_og > 128 and head_dim_og <= 256:
+        q = torch.nn.functional.pad(q, (0, 256 - head_dim_og))
+        k = torch.nn.functional.pad(k, (0, 256 - head_dim_og))
+        v = torch.nn.functional.pad(v, (0, 256 - head_dim_og))
+    elif head_dim_og > 256:
         raise ValueError(f"Unsupported head_dim: {head_dim_og}")
 
     if sm_scale is None:
@@ -562,7 +571,11 @@ def sageattn_qk_int8_pv_fp8_cuda(
         q = torch.nn.functional.pad(q, (0, 128 - head_dim_og))
         k = torch.nn.functional.pad(k, (0, 128 - head_dim_og))
         v = torch.nn.functional.pad(v, (0, 128 - head_dim_og))
-    elif head_dim_og > 128:
+    elif head_dim_og > 128 and head_dim_og <= 256:
+        q = torch.nn.functional.pad(q, (0, 256 - head_dim_og))
+        k = torch.nn.functional.pad(k, (0, 256 - head_dim_og))
+        v = torch.nn.functional.pad(v, (0, 256 - head_dim_og))
+    elif head_dim_og > 256:
         raise ValueError(f"Unsupported head_dim: {head_dim_og}")
 
     assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, "Last dim of qkv must be contiguous."
@@ -648,7 +661,11 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
         q = torch.nn.functional.pad(q, (0, 128 - head_dim_og))
         k = torch.nn.functional.pad(k, (0, 128 - head_dim_og))
         v = torch.nn.functional.pad(v, (0, 128 - head_dim_og))
-    elif head_dim_og > 128:
+    elif head_dim_og > 128 and head_dim_og <= 256:
+        q = torch.nn.functional.pad(q, (0, 256 - head_dim_og))
+        k = torch.nn.functional.pad(k, (0, 256 - head_dim_og))
+        v = torch.nn.functional.pad(v, (0, 256 - head_dim_og))
+    elif head_dim_og > 256:
         raise ValueError(f"Unsupported head_dim: {head_dim_og}")
 
     assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, "Last dim of qkv must be contiguous."
