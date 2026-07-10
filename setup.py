@@ -18,6 +18,7 @@ import os
 import subprocess
 from packaging.version import parse, Version
 from typing import List, Set
+from setuptools import setup, Extension
 import warnings
 
 from setuptools import setup, find_packages
@@ -31,10 +32,8 @@ HAS_SM89 = False
 HAS_SM90 = False
 HAS_SM120 = False
 
-# Supported NVIDIA GPU architectures.
 SUPPORTED_ARCHS = {"7.5", "8.0", "8.6", "8.9", "9.0", "12.0"}
 
-# Compiler flags.
 CXX_FLAGS = ["-g", "-O3", "-fopenmp", "-lgomp", "-std=c++17", "-DENABLE_BF16"]
 NVCC_FLAGS = [
     "-O3",
@@ -44,7 +43,7 @@ NVCC_FLAGS = [
     "--use_fast_math",
     "--threads=8",
     "-Xptxas=-v",
-    "-diag-suppress=174", # suppress the specific warning
+    "-diag-suppress=174", 
 ]
 
 ABI = 1 if torch._C._GLIBCXX_USE_CXX11_ABI else 0
@@ -56,10 +55,6 @@ if CUDA_HOME is None:
         "Cannot find CUDA_HOME. CUDA must be available to build the package.")
 
 def get_nvcc_cuda_version(cuda_dir: str) -> Version:
-    """Get the CUDA version from nvcc.
-
-    Adapted from https://github.com/NVIDIA/apex/blob/8b7a1ff183741dd8f9b87e7bafd04cfde99cea28/setup.py
-    """
     nvcc_output = subprocess.check_output([cuda_dir + "/bin/nvcc", "-V"],
                                           universal_newlines=True)
     output = nvcc_output.split()
@@ -67,7 +62,6 @@ def get_nvcc_cuda_version(cuda_dir: str) -> Version:
     nvcc_cuda_version = parse(output[release_idx].split(",")[0])
     return nvcc_cuda_version
 
-# Iterate over all GPUs on the current machine. Also you can modify this part to specify the architecture if you want to build for specific GPU architectures.
 compute_capabilities = set()
 device_count = torch.cuda.device_count()
 for i in range(device_count):
@@ -83,20 +77,6 @@ if not compute_capabilities:
 else:
     print(f"Detect GPUs with compute capabilities: {compute_capabilities}")
 
-# Validate the NVCC CUDA version.
-#if nvcc_cuda_version < Version("12.0"):
-#    raise RuntimeError("CUDA 12.0 or higher is required to build the package.")
-#if nvcc_cuda_version < Version("12.4") and any(cc.startswith("8.9") for cc in compute_capabilities):
-#    raise RuntimeError(
-#        "CUDA 12.4 or higher is required for compute capability 8.9.")
-#if nvcc_cuda_version < Version("12.3") and any(cc.startswith("9.0") for cc in compute_capabilities):
-#    raise RuntimeError(
-#        "CUDA 12.3 or higher is required for compute capability 9.0.")
-#if nvcc_cuda_version < Version("12.8") and any(cc.startswith("12.0") for cc in compute_capabilities):
-#    raise RuntimeError(
-#        "CUDA 12.8 or higher is required for compute capability 12.0.")
-
-# Add target compute capabilities to NVCC flags.
 for capability in compute_capabilities:
     if capability.startswith("8.0"):
         HAS_SM80 = True
@@ -112,10 +92,10 @@ for capability in compute_capabilities:
         num = "89"
     elif capability.startswith("9.0"):
         HAS_SM90 = True
-        num = "90a" # need to use sm90a instead of sm90 to use wgmma ptx instruction.
+        num = "90a" 
     elif capability.startswith("12.0"):
         HAS_SM120 = True
-        num = "120" # need to use sm120a to use mxfp8/mxfp4/nvfp4 instructions.
+        num = "120" 
     NVCC_FLAGS += ["-gencode", f"arch=compute_{num},code=sm_{num}"]
     if capability.endswith("+PTX"):
         NVCC_FLAGS += ["-gencode", f"arch=compute_{num},code=compute_{num}"]
@@ -165,7 +145,6 @@ if HAS_SM90:
     )
     ext_modules.append(qattn_extension)
 
-# Fused kernels.
 fused_extension = CUDAExtension(
     name="sageattention._fused",
     sources=["csrc/fused/pybind.cpp", "csrc/fused/fused.cu"],
@@ -176,12 +155,38 @@ fused_extension = CUDAExtension(
 )
 ext_modules.append(fused_extension)
 
+if HAS_SM75:
+    fast_attn_sources = ["csrc/fast_attn_sm75.cu", "csrc/fast_attn_sm75_bind.cpp"]
+else:
+    fast_attn_sources = ["csrc/fast_attn.cpp"]
+    
+fast_attn_extension = CUDAExtension(
+    name="sageattention._fast_attn",
+    sources=fast_attn_sources,
+    extra_compile_args={
+        "cxx": CXX_FLAGS,
+        "nvcc": NVCC_FLAGS if HAS_SM75 else [],
+    },
+)
+ext_modules.append(fast_attn_extension)
+
+if HAS_SM75:
+    sm75_fast_dispatch_extension = CUDAExtension(
+        name="sageattention._sm75_fast_dispatch",
+        sources=["csrc/sm75_fast_dispatch.cu", "csrc/sm75_fast_dispatch_bind.cpp"],
+        extra_compile_args={
+            "cxx": CXX_FLAGS,
+            "nvcc": NVCC_FLAGS,
+        },
+    )
+    ext_modules.append(sm75_fast_dispatch_extension)
+
 setup(
     name='sageattention', 
-    version='2.1.1',  
+    version='2.1.2',
     author='SageAttention team',
     license='Apache 2.0 License',  
-    description='Accurate and efficient plug-and-play low-bit attention.',  
+    description='Accurate and efficient plug-and-play low-bit attention, modified for Turing.',  
     long_description=open('README.md').read(),  
     long_description_content_type='text/markdown', 
     url='https://github.com/thu-ml/SageAttention', 
@@ -190,4 +195,3 @@ setup(
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
 )
-

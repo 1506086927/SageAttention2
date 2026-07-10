@@ -47,9 +47,8 @@ __device__ __forceinline__ void commit_group() {
 #ifdef CP_ASYNC_ENABLED
   asm volatile("cp.async.commit_group;\n" ::);
 #else
-  // For SM75, we might need some form of barrier to ensure copies are visible
-  // Adding a lightweight fence
-  __threadfence_block();
+  // SM75 fallback: synchronous copies via ld.global are already visible 
+  // No barrier needed here.
 #endif
 }
 
@@ -62,8 +61,8 @@ __device__ __forceinline__ void wait_group() {
 #ifdef CP_ASYNC_ENABLED
   asm volatile("cp.async.wait_group %0;\n" ::"n"(n));
 #else
-  // For SM75, we don't need to wait as we're using synchronous copies
-  __syncthreads();  // Add a barrier for safety
+  // SM75 optimization: Removed redundant __syncthreads() to drastically improve pipelining
+  // Caller manages shared memory boundaries with dedicated __syncthreads() where needed.
 #endif
 }
 
@@ -87,9 +86,14 @@ __device__ __forceinline__ void load_128b(T* smem_ptr, const T* gmem_ptr) {
                 "l"(gmem_ptr), "n"(16), "r"(16));
   }
 #else
-  // Optimization for Turing: Use __ldg to force loading through read-only data cache (Texture Cache).
-  // This bypasses L1 cache coherence overhead and improves bandwidth for read-only data (Q/K/V).
-  *((uint4*)smem_ptr) = __ldg((const uint4*)gmem_ptr);
+  // SM75 fallback vector load (force 128-bit)
+  uint4 val;
+  asm volatile(
+      "ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+      : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w)
+      : "l"(gmem_ptr)
+  );
+  *reinterpret_cast<uint4*>(smem_ptr) = val;
 #endif
 }
 
@@ -138,11 +142,16 @@ __device__ __forceinline__ void pred_load_128b(T* smem_ptr, const T* gmem_ptr, b
   }
 #else
   if (predicate) {
-    // Optimization for Turing: Use __ldg for cached read-only access.
-    *((uint4*)smem_ptr) = __ldg((const uint4*)gmem_ptr);
+    uint4 val;
+    asm volatile(
+        "ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+        : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w)
+        : "l"(gmem_ptr)
+    );
+    *reinterpret_cast<uint4*>(smem_ptr) = val;
   } else {
     if constexpr (fill_mode == SharedMemFillMode::kFillZero) {
-      *((uint4*)smem_ptr) = make_uint4(0, 0, 0, 0);
+      *reinterpret_cast<uint4*>(smem_ptr) = make_uint4(0, 0, 0, 0);
     }
   }
 #endif

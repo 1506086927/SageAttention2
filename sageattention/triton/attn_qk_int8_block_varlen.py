@@ -44,6 +44,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len,
         acc = acc * alpha[:, None]
         
         v = tl.load(V_ptrs, mask = offs_n[:, None] < (kv_len - start_n))
+        v = v.to(tl.float16)
         p = p.to(tl.float16)
         
         acc += tl.dot(p, v, out_dtype=tl.float16)   
@@ -117,10 +118,19 @@ def _attn_fwd(Q, K, V,
     acc = acc / l_i[:, None]
     tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask = (offs_m[:, None] < qo_len))
 
-def forward(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, output_dtype=torch.float16):
-    BLOCK_M = 128
-    BLOCK_N = 64
-    stage = 1
+def forward(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, output_dtype=torch.float16, is_sm75=False):
+    if is_sm75:
+        BLOCK_M = 64
+        BLOCK_N = 64
+        stage = 1
+        num_warps = 4
+        num_stages = 2
+    else:
+        BLOCK_M = 128
+        BLOCK_N = 64
+        stage = 1
+        num_warps = 4 if q.shape[-1] == 64 else 8
+        num_stages = 3 if q.shape[-1] == 64 else 4
 
     o = torch.empty(q.shape, dtype=output_dtype, device=q.device)
 
@@ -143,6 +153,38 @@ def forward(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, q_scale, k_scale,
         h_qo, num_kv_groups,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM_K,  
         STAGE=stage,  
-        num_warps=4 if head_dim == 64 else 8,
-        num_stages=3 if head_dim == 64 else 4)
+        num_warps=num_warps,
+        num_stages=num_stages)
+    return o
+
+def forward_blk64(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, output_dtype=torch.float16):
+    o = torch.empty(q.shape, dtype=output_dtype, device=q.device)
+
+    b = cu_seqlens_q.shape[0] - 1
+    _, h_qo, head_dim = q.shape
+    _, h_kv, _ = k.shape
+
+    HEAD_DIM_K = head_dim
+    num_kv_groups = h_qo // h_kv
+
+    BLOCK_M = 64
+    BLOCK_N = 64
+    stage = 1
+    num_warps = 4
+    num_stages = 2
+
+    grid = (triton.cdiv(max_seqlen_q, BLOCK_M), h_qo, b)
+    _attn_fwd[grid](
+        q, k, v, cu_seqlens_q, cu_seqlens_k,
+        q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale,
+        o,  
+        q.stride(1), q.stride(0), 
+        k.stride(1), k.stride(0),  
+        v.stride(1), v.stride(0), 
+        o.stride(1), o.stride(0),
+        h_qo, num_kv_groups,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM_K,  
+        STAGE=stage,  
+        num_warps=num_warps,
+        num_stages=num_stages)
     return o

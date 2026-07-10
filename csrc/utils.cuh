@@ -15,7 +15,7 @@
  */
 
 #pragma once
-#include <torch/extension.h>
+#include <torch/types.h>
 
 #define CHECK_CUDA(x) \
   TORCH_CHECK(x.is_cuda(), "Tensor " #x " must be on CUDA")

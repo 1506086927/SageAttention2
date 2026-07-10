@@ -102,3 +102,6 @@ def per_block_int8(q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
     )
 
     return q_int8, q_scale, k_int8, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale
+
+def per_block_int8_blk64(q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, sm_scale=None):
+    return per_block_int8(q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, BLKQ=64, BLKK=64, sm_scale=sm_scale)

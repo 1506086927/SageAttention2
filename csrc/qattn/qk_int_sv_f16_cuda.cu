@@ -17,7 +17,7 @@
 #include "../utils.cuh"
 #include <cuda_fp16.h>
 #include <cuda_pipeline_primitives.h>
-#include <torch/extension.h>
+#include <torch/types.h>
 
 #include "../cp_async.cuh"
 #include "../mma.cuh"
@@ -851,6 +851,13 @@ torch::Tensor qk_int8_sv_f16_accum_f32_attn(torch::Tensor query,
               stride_bz_v, stride_seq_v, stride_h_v,
               stride_bz_o, stride_seq_o, stride_h_o,
               sm_scale);
+
+            cudaError_t error = cudaGetLastError();
+            if (error != cudaSuccess) {
+                std::ostringstream err_msg;
+                err_msg << "CUDA kernel launch failed with error: " << cudaGetErrorString(error);
+                throw std::runtime_error(err_msg.str());
+            }
           });
         });
       });
@@ -1088,9 +1095,9 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn(torch::Tensor query,
 
             cudaError_t error = cudaGetLastError();
             if (error != cudaSuccess) {
-                std::cerr << "CUDA kernel launch! failed with error: " << cudaGetErrorString(error) << std::endl;
-                // You might want to throw an exception or handle the error more gracefully here
-                throw std::runtime_error("CUDA kernel! launch failed");
+                std::ostringstream err_msg;
+                err_msg << "CUDA kernel launch failed with error: " << cudaGetErrorString(error);
+                throw std::runtime_error(err_msg.str());
             }
           });
         });
@@ -1278,6 +1285,13 @@ torch::Tensor qk_int8_sv_f16_accum_f16_attn_inst_buf(torch::Tensor query,
               stride_bz_v, stride_seq_v, stride_h_v,
               stride_bz_o, stride_seq_o, stride_h_o,
               sm_scale);
+
+            cudaError_t error = cudaGetLastError();
+            if (error != cudaSuccess) {
+                std::ostringstream err_msg;
+                err_msg << "CUDA kernel launch failed with error: " << cudaGetErrorString(error);
+                throw std::runtime_error(err_msg.str());
+            }
           });
         });
       });
@@ -1462,6 +1476,13 @@ torch::Tensor qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(torch::Tensor query,
               stride_bz_v, stride_seq_v, stride_h_v,
               stride_bz_o, stride_seq_o, stride_h_o,
               sm_scale);
+
+            cudaError_t error = cudaGetLastError();
+            if (error != cudaSuccess) {
+                std::ostringstream err_msg;
+                err_msg << "CUDA kernel launch failed with error: " << cudaGetErrorString(error);
+                throw std::runtime_error(err_msg.str());
+            }
           });
         });
       });
