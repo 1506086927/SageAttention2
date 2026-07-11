@@ -117,14 +117,12 @@ def sageattn(
         v = v.to(torch.float16)
 
     seq_len = q.size(2) if tensor_layout == "HND" else q.size(1)
-    
-    q_heads = q.size(1) if tensor_layout == "HND" else q.size(2)
-    kv_heads = k.size(1) if tensor_layout == "HND" else k.size(2)
-    is_gqa = (q_heads != kv_heads)
+
 
     if arch == "sm86" or is_sm75:
         if is_sm75:
-            if seq_len >= 1024 or is_gqa or return_lse:
+            # 修复1：不再判断 is_gqa，短序列/GQA全部放行给下方 SDPA 处理
+            if seq_len >= 1024 and not return_lse:
                 result = sageattn_qk_int8_pv_fp16_cuda(
                     q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, 
                     qk_quant_gran="per_warp", sm_scale=sm_scale, 
@@ -143,6 +141,14 @@ def sageattn(
                     v_tmp = v.transpose(1, 2)
                 else:
                     q_tmp, k_tmp, v_tmp = q, k, v
+
+                # 修复2：在这里统一拦截 GQA，并进行 repeat_interleave
+                q_heads = q_tmp.size(1)
+                kv_heads = k_tmp.size(1)
+                if q_heads != kv_heads and q_heads % kv_heads == 0:
+                    num_replicas = q_heads // kv_heads
+                    k_tmp = k_tmp.repeat_interleave(num_replicas, dim=1)
+                    v_tmp = v_tmp.repeat_interleave(num_replicas, dim=1)
 
                 result = _sm75_sdpa(
                     q_tmp, k_tmp, v_tmp,
@@ -309,31 +315,30 @@ def sageattn_varlen(
     if sm_scale is None:
         sm_scale = 1.0 / (head_dim_og ** 0.5)
 
-    if is_sm75:
-        # 硬分支加载专用 blk64 静态常量核函数，防止 Triton 编译崩溃
-        from .triton.quant_per_block_varlen import per_block_int8_blk64 as per_block_int8_varlen_triton_blk64
-        from .triton.attn_qk_int8_per_block_causal_varlen import forward_blk64 as attn_true_varlen_blk64
-        from .triton.attn_qk_int8_block_varlen import forward_blk64 as attn_false_varlen_blk64
-        
-        q_int8, q_scale, k_int8, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale = per_block_int8_varlen_triton_blk64(
-            q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, sm_scale=sm_scale
+    # 修复3：清理旧版本残留的 _blk64 导入，直接传参
+    from .triton.quant_per_block_varlen import per_block_int8 as per_block_int8_varlen_triton
+    from .triton.attn_qk_int8_per_block_causal_varlen import forward as attn_true_varlen
+    from .triton.attn_qk_int8_block_varlen import forward as attn_false_varlen
+    
+    # 动态适应 SM75 的 block_size
+    blkq_val = 64 if is_sm75 else 128
+    
+    q_int8, q_scale, k_int8, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale = per_block_int8_varlen_triton(
+        q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, BLKQ=blkq_val, BLKK=64, sm_scale=sm_scale
+    )
+    
+    if is_causal:
+        o = attn_true_varlen(
+            q_int8, k_int8, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
+            q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, 
+            output_dtype=compute_dtype, is_sm75=is_sm75
         )
-        if is_causal:
-            o = attn_true_varlen_blk64(q_int8, k_int8, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, output_dtype=compute_dtype)
-        else:
-            o = attn_false_varlen_blk64(q_int8, k_int8, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, output_dtype=compute_dtype)
     else:
-        from .triton.quant_per_block_varlen import per_block_int8 as per_block_int8_varlen_triton
-        from .triton.attn_qk_int8_per_block_causal_varlen import forward as attn_true_varlen
-        from .triton.attn_qk_int8_block_varlen import forward as attn_false_varlen
-        
-        q_int8, q_scale, k_int8, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale = per_block_int8_varlen_triton(
-            q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, sm_scale=sm_scale
+        o = attn_false_varlen(
+            q_int8, k_int8, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
+            q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, 
+            output_dtype=compute_dtype, is_sm75=is_sm75
         )
-        if is_causal:
-            o = attn_true_varlen(q_int8, k_int8, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, output_dtype=compute_dtype, is_sm75=False)
-        else:
-            o = attn_false_varlen(q_int8, k_int8, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, output_dtype=compute_dtype, is_sm75=False)
 
     o = o[..., :head_dim_og]
     
