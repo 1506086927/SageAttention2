@@ -100,6 +100,12 @@ def sageattn(
 
     _set_device_if_needed(v.device)
 
+    # 统一确保物理内存连续，解决 C++ 量化核基于 float4 128-bit 向量化加载越界的问题
+    # 不强制篡改张量形状，保留外界期待的 tensor_layout 返回值
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+
     major, minor = _get_device_sm(q.device)
     arch = f"sm{major}{minor}"
     is_sm75 = (major == 7 and minor == 5)
@@ -115,10 +121,6 @@ def sageattn(
         v = v.to(torch.float16)
 
     seq_len = q.size(2) if tensor_layout == "HND" else q.size(1)
-    
-    q_heads = q.size(1) if tensor_layout == "HND" else q.size(2)
-    kv_heads = k.size(1) if tensor_layout == "HND" else k.size(2)
-    is_gqa = (q_heads != kv_heads)
 
     if arch == "sm86" or is_sm75:
         if is_sm75:
@@ -143,15 +145,15 @@ def sageattn(
                     k_tmp = k.transpose(1, 2).contiguous()
                     v_tmp = v.transpose(1, 2).contiguous()
                 else:
-                    q_tmp = q.contiguous()
-                    k_tmp = k.contiguous()
-                    v_tmp = v.contiguous()
+                    q_tmp = q
+                    k_tmp = k
+                    v_tmp = v
 
                 result = _sm75_fast_dispatch.sm75_fast_sdpa(
                     q_tmp, k_tmp, v_tmp, is_causal, sm_scale if sm_scale is not None else 0.0
                 )
 
-                # 将结果转置回期望的 NHD
+                # 将结果转置回期望的 NHD 格式
                 if is_nhd:
                     result = result.transpose(1, 2).contiguous()
                 
@@ -318,10 +320,19 @@ def sageattn_varlen(
     q_int8, q_scale, k_int8, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale = per_block_int8_varlen_triton(
         q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, BLKQ=blkq_val, BLKK=64, sm_scale=sm_scale
     )
+    
     if is_causal:
-        o = attn_true_varlen(q_int8, k_int8, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, output_dtype=compute_dtype, is_sm75=is_sm75)
+        o = attn_true_varlen(
+            q_int8, k_int8, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
+            q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, 
+            output_dtype=compute_dtype, is_sm75=is_sm75
+        )
     else:
-        o = attn_false_varlen(q_int8, k_int8, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, output_dtype=compute_dtype, is_sm75=is_sm75)
+        o = attn_false_varlen(
+            q_int8, k_int8, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
+            q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, 
+            output_dtype=compute_dtype, is_sm75=is_sm75
+        )
 
     o = o[..., :head_dim_og]
     

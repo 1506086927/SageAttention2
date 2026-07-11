@@ -43,39 +43,24 @@ at::Tensor sm75_fast_sdpa(
         // Fall through to PyTorch if custom kernel failed
     }
 
-    // Tier 2: PyTorch SDPA for short sequences (C++ eliminates Python overhead)
-    // Covers short self-attention and cross-attention
-    if (seq_q < 256 && seq_kv < 512) {
-        // Expand K and V for GQA before calling PyTorch SDPA to prevent errors in earlier PyTorch versions
-        at::Tensor k_expanded = k;
-        at::Tensor v_expanded = v;
-        if (q_heads != kv_heads) {
-            int64_t num_kv_groups = q_heads / kv_heads;
-            k_expanded = k.repeat_interleave(num_kv_groups, 1);
-            v_expanded = v.repeat_interleave(num_kv_groups, 1);
-        }
-
-        return at::scaled_dot_product_attention(
-            q, k_expanded, v_expanded,
-            ::std::optional<at::Tensor>(),  // no attention mask
-            0.0,           // no dropout
-            is_causal,
-            ::std::optional<double>(scale)
-        );
+    // Tier 2: PyTorch SDPA for all other sequences (C++ eliminates Python overhead)
+    // Expand K and V for GQA before calling PyTorch SDPA to prevent errors in earlier PyTorch versions
+    at::Tensor k_expanded = k;
+    at::Tensor v_expanded = v;
+    if (q_heads != kv_heads) {
+        int64_t num_kv_groups = q_heads / kv_heads;
+        k_expanded = k.repeat_interleave(num_kv_groups, 1);
+        v_expanded = v.repeat_interleave(num_kv_groups, 1);
     }
 
-    // Tier 3: Everything else - fall back to Python sageattn()
-    // This handles GQA, long sequences, NHD layout, BF16, INT8 path, etc.
-    py::module_ sage_module = py::module_::import("sageattention");
-    py::object sageattn = sage_module.attr("sageattn");
-
-    py::kwargs kwargs;
-    kwargs["tensor_layout"] = std::string("HND");
-    kwargs["is_causal"] = is_causal;
-    kwargs["sm_scale"] = scale;
-    kwargs["return_lse"] = false;
-
-    return sageattn(q, k, v, **kwargs).cast<at::Tensor>();
+    // Directly return native SDPA, never fall back to Python to prevent infinite recursion
+    return at::scaled_dot_product_attention(
+        q, k_expanded, v_expanded,
+        ::std::optional<at::Tensor>(),  // no attention mask
+        0.0,           // no dropout
+        is_causal,
+        ::std::optional<double>(scale)
+    );
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
