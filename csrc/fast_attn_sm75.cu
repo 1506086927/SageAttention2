@@ -17,6 +17,7 @@
 
 // Optimized attention kernel for short sequences using half2 vectorization
 // FIXED: Added proper alignment handling to avoid cudaErrorMisalignedAddress
+// FIXED: Support GQA addressing and add strict out-of-bounds masks
 template<int D, bool IS_CAUSAL>
 __global__ void __launch_bounds__(256)
 fast_attn_kernel_half2(
@@ -25,9 +26,16 @@ fast_attn_kernel_half2(
     const half* __restrict__ V,
     half* __restrict__ O,
     int N,
-    float scale)
+    float scale,
+    int num_heads,
+    int num_kv_heads)
 {
-    const int bh = blockIdx.x;  // batch * H + head
+    const int bh = blockIdx.x;  // batch * num_heads + head
+    const int batch_idx = bh / num_heads;
+    const int head_idx = bh % num_heads;
+    const int kv_head_idx = head_idx / (num_heads / num_kv_heads);
+    const int b_kv_h = batch_idx * num_kv_heads + kv_head_idx;
+    
     const int tid = threadIdx.x;
 
     // Shared memory
@@ -55,8 +63,8 @@ fast_attn_kernel_half2(
             int d = base_idx % D;
 
             half2 q_val = reinterpret_cast<const half2*>(&Q[bh * N * D + r * D + d])[0];
-            half2 k_val = reinterpret_cast<const half2*>(&K[bh * N * D + r * D + d])[0];
-            half2 v_val = reinterpret_cast<const half2*>(&V[bh * N * D + r * D + d])[0];
+            half2 k_val = reinterpret_cast<const half2*>(&K[b_kv_h * N * D + r * D + d])[0];
+            half2 v_val = reinterpret_cast<const half2*>(&V[b_kv_h * N * D + r * D + d])[0];
             reinterpret_cast<half2*>(&smem_q[r * D + d])[0] = q_val;
             reinterpret_cast<half2*>(&smem_k[r * D + d])[0] = k_val;
             reinterpret_cast<half2*>(&smem_v[r * D + d])[0] = v_val;
@@ -68,8 +76,8 @@ fast_attn_kernel_half2(
             int d = idx % D;
 
             smem_q[r * D + d] = Q[bh * N * D + r * D + d];
-            smem_k[r * D + d] = K[bh * N * D + r * D + d];
-            smem_v[r * D + d] = V[bh * N * D + r * D + d];
+            smem_k[r * D + d] = K[b_kv_h * N * D + r * D + d];
+            smem_v[r * D + d] = V[b_kv_h * N * D + r * D + d];
         }
     }
     __syncthreads();
@@ -81,7 +89,8 @@ fast_attn_kernel_half2(
         
         #pragma unroll
         for (int j = 0; j < N; ++j) {
-            if (IS_CAUSAL && j > i) {
+            // [FIXED] Explicit OOB masking to prevent processing padded garbage
+            if ((IS_CAUSAL && j > i) || (j >= N) || (i >= N)) {
                 smem_s[i * N + j] = -1e20f;
                 continue;
             }
@@ -161,6 +170,7 @@ torch::Tensor fast_short_seq_attn(
     const int num_heads = q.size(1);
     const int seq_len = q.size(2);
     const int head_dim = q.size(3);
+    const int num_kv_heads = k.size(1);
     
     // Ensure output tensor is contiguous
     torch::Tensor o = torch::empty_like(q).contiguous();
@@ -180,8 +190,15 @@ torch::Tensor fast_short_seq_attn(
     // If too large, fall back to PyTorch SDPA
     if (smem_size > 48 * 1024) {
         // Fall back to PyTorch SDPA for large sequences
+        at::Tensor k_expanded = k;
+        at::Tensor v_expanded = v;
+        if (num_heads != num_kv_heads) {
+            int64_t num_kv_groups = num_heads / num_kv_heads;
+            k_expanded = k.repeat_interleave(num_kv_groups, 1);
+            v_expanded = v.repeat_interleave(num_kv_groups, 1);
+        }
         return at::native::scaled_dot_product_attention(
-            q, k, v,
+            q, k_expanded, v_expanded,
             /*attn_mask=*/c10::nullopt,
             /*dropout_p=*/0.0,
             is_causal,
@@ -195,7 +212,7 @@ torch::Tensor fast_short_seq_attn(
             reinterpret_cast<const half*>(k.data_ptr()), \
             reinterpret_cast<const half*>(v.data_ptr()), \
             reinterpret_cast<half*>(o.data_ptr()), \
-            seq_len, static_cast<float>(sm_scale))
+            seq_len, static_cast<float>(sm_scale), num_heads, num_kv_heads)
     
     if (head_dim == 64) {
         if (is_causal) {
@@ -217,8 +234,15 @@ torch::Tensor fast_short_seq_attn(
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         // Fall back to PyTorch SDPA on error
+        at::Tensor k_expanded = k;
+        at::Tensor v_expanded = v;
+        if (num_heads != num_kv_heads) {
+            int64_t num_kv_groups = num_heads / num_kv_heads;
+            k_expanded = k.repeat_interleave(num_kv_groups, 1);
+            v_expanded = v.repeat_interleave(num_kv_groups, 1);
+        }
         o = at::native::scaled_dot_product_attention(
-            q, k, v,
+            q, k_expanded, v_expanded,
             /*attn_mask=*/c10::nullopt,
             /*dropout_p=*/0.0,
             is_causal,
@@ -228,4 +252,3 @@ torch::Tensor fast_short_seq_attn(
     
     return o;
 }
-

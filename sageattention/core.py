@@ -85,8 +85,6 @@ def _validate_inputs(q, k, v):
         assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
         assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, "Last dim of qkv must be contiguous."
 
-_sm75_sdpa = torch.nn.functional.scaled_dot_product_attention
-
 def sageattn(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -117,12 +115,15 @@ def sageattn(
         v = v.to(torch.float16)
 
     seq_len = q.size(2) if tensor_layout == "HND" else q.size(1)
-
+    
+    q_heads = q.size(1) if tensor_layout == "HND" else q.size(2)
+    kv_heads = k.size(1) if tensor_layout == "HND" else k.size(2)
+    is_gqa = (q_heads != kv_heads)
 
     if arch == "sm86" or is_sm75:
         if is_sm75:
-            # 修复1：不再判断 is_gqa，短序列/GQA全部放行给下方 SDPA 处理
-            if seq_len >= 1024 and not return_lse:
+            # 对于长序列，回退到 CUDA 量化核心（原生支持 stride NHD）
+            if seq_len >= 1024 or return_lse:
                 result = sageattn_qk_int8_pv_fp16_cuda(
                     q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, 
                     qk_quant_gran="per_warp", sm_scale=sm_scale, 
@@ -133,33 +134,26 @@ def sageattn(
                     return o.to(orig_dtype), lse
                 return result.to(orig_dtype)
             else:
+                from . import _sm75_fast_dispatch
                 is_nhd = (tensor_layout == "NHD")
                 
+                # 隔离内存操作：仅在送入假定 HND 物理布局的 C++ 核心前转置并强制连续
                 if is_nhd:
-                    q_tmp = q.transpose(1, 2)
-                    k_tmp = k.transpose(1, 2)
-                    v_tmp = v.transpose(1, 2)
+                    q_tmp = q.transpose(1, 2).contiguous()
+                    k_tmp = k.transpose(1, 2).contiguous()
+                    v_tmp = v.transpose(1, 2).contiguous()
                 else:
-                    q_tmp, k_tmp, v_tmp = q, k, v
+                    q_tmp = q.contiguous()
+                    k_tmp = k.contiguous()
+                    v_tmp = v.contiguous()
 
-                # 修复2：在这里统一拦截 GQA，并进行 repeat_interleave
-                q_heads = q_tmp.size(1)
-                kv_heads = k_tmp.size(1)
-                if q_heads != kv_heads and q_heads % kv_heads == 0:
-                    num_replicas = q_heads // kv_heads
-                    k_tmp = k_tmp.repeat_interleave(num_replicas, dim=1)
-                    v_tmp = v_tmp.repeat_interleave(num_replicas, dim=1)
-
-                result = _sm75_sdpa(
-                    q_tmp, k_tmp, v_tmp,
-                    attn_mask=None,
-                    dropout_p=0.0,
-                    is_causal=is_causal,
-                    scale=sm_scale
+                result = _sm75_fast_dispatch.sm75_fast_sdpa(
+                    q_tmp, k_tmp, v_tmp, is_causal, sm_scale if sm_scale is not None else 0.0
                 )
 
+                # 将结果转置回期望的 NHD
                 if is_nhd:
-                    result = result.transpose(1, 2)
+                    result = result.transpose(1, 2).contiguous()
                 
                 return result.to(orig_dtype)
         else:
@@ -315,30 +309,19 @@ def sageattn_varlen(
     if sm_scale is None:
         sm_scale = 1.0 / (head_dim_og ** 0.5)
 
-    # 修复3：清理旧版本残留的 _blk64 导入，直接传参
     from .triton.quant_per_block_varlen import per_block_int8 as per_block_int8_varlen_triton
     from .triton.attn_qk_int8_per_block_causal_varlen import forward as attn_true_varlen
     from .triton.attn_qk_int8_block_varlen import forward as attn_false_varlen
     
-    # 动态适应 SM75 的 block_size
     blkq_val = 64 if is_sm75 else 128
     
     q_int8, q_scale, k_int8, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale = per_block_int8_varlen_triton(
         q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, BLKQ=blkq_val, BLKK=64, sm_scale=sm_scale
     )
-    
     if is_causal:
-        o = attn_true_varlen(
-            q_int8, k_int8, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
-            q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, 
-            output_dtype=compute_dtype, is_sm75=is_sm75
-        )
+        o = attn_true_varlen(q_int8, k_int8, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, output_dtype=compute_dtype, is_sm75=is_sm75)
     else:
-        o = attn_false_varlen(
-            q_int8, k_int8, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
-            q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, 
-            output_dtype=compute_dtype, is_sm75=is_sm75
-        )
+        o = attn_false_varlen(q_int8, k_int8, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, output_dtype=compute_dtype, is_sm75=is_sm75)
 
     o = o[..., :head_dim_og]
     
@@ -460,7 +443,6 @@ def sageattn_qk_int8_pv_fp16_cuda(
             else:
                 lse_correction = torch.matmul(q, km_for_correction.transpose(2, 3)).squeeze(-1).to(torch.float32)
         except Exception as e:
-            import warnings
             warnings.warn(f"Skipping lse_correction due to: {e}")
             lse_correction = None
 

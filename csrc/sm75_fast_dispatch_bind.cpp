@@ -34,8 +34,7 @@ at::Tensor sm75_fast_sdpa(
 
     // Tier 1: Custom CUDA kernel for very short sequences (beats PyTorch)
     // Covers SD text encoding (seq=77) and similar
-    // Only for MHA (no GQA) and supported head dims
-    if (seq_q <= 128 && seq_kv <= 128 && q_heads == kv_heads && 
+    if (seq_q <= 128 && seq_kv <= 128 && 
         (dim == 64 || dim == 128)) {
         at::Tensor result = sm75_custom_short_sdpa(q, k, v, is_causal, scale_f);
         if (result.defined() && result.numel() > 0) {
@@ -47,8 +46,17 @@ at::Tensor sm75_fast_sdpa(
     // Tier 2: PyTorch SDPA for short sequences (C++ eliminates Python overhead)
     // Covers short self-attention and cross-attention
     if (seq_q < 256 && seq_kv < 512) {
+        // Expand K and V for GQA before calling PyTorch SDPA to prevent errors in earlier PyTorch versions
+        at::Tensor k_expanded = k;
+        at::Tensor v_expanded = v;
+        if (q_heads != kv_heads) {
+            int64_t num_kv_groups = q_heads / kv_heads;
+            k_expanded = k.repeat_interleave(num_kv_groups, 1);
+            v_expanded = v.repeat_interleave(num_kv_groups, 1);
+        }
+
         return at::scaled_dot_product_attention(
-            q, k, v,
+            q, k_expanded, v_expanded,
             ::std::optional<at::Tensor>(),  // no attention mask
             0.0,           // no dropout
             is_causal,

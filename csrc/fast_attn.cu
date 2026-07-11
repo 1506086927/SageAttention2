@@ -89,18 +89,20 @@ template<int HEAD_DIM, bool IS_CAUSAL>
 __global__ void __launch_bounds__(NUM_WARPS * WARP_SIZE)
 sdpa_kernel_fp16(
     const half* __restrict__ Q,      // [B, H, N, D]
-    const half* __restrict__ K,      // [B, H, N, D]
-    const half* __restrict__ V,      // [B, H, N, D]
+    const half* __restrict__ K,      // [B, H_kv, N, D]
+    const half* __restrict__ V,      // [B, H_kv, N, D]
     half* __restrict__ O,            // [B, H, N, D]
     const int seq_len,
     const int batch_size,
     const int num_heads,
+    const int num_kv_heads,
     const float sm_scale)
 {
     // Block handles one (batch, head, query_block) combination
     const int batch_head_idx = blockIdx.y;
     const int batch_idx = batch_head_idx / num_heads;
     const int head_idx = batch_head_idx % num_heads;
+    const int kv_head_idx = head_idx / (num_heads / num_kv_heads);
     const int query_block_idx = blockIdx.x;
     
     const int tid = threadIdx.x;
@@ -109,9 +111,10 @@ sdpa_kernel_fp16(
     
     // Base pointers for this batch/head
     const int bhd_offset = (batch_idx * num_heads + head_idx) * seq_len * HEAD_DIM;
+    const int kv_bhd_offset = (batch_idx * num_kv_heads + kv_head_idx) * seq_len * HEAD_DIM;
     const half* q_ptr = Q + bhd_offset;
-    const half* k_ptr = K + bhd_offset;
-    const half* v_ptr = V + bhd_offset;
+    const half* k_ptr = K + kv_bhd_offset;
+    const half* v_ptr = V + kv_bhd_offset;
     half* o_ptr = O + bhd_offset;
     
     // Shared memory layout
@@ -321,17 +324,20 @@ sdpa_small_seq_kernel_fp16(
     const int seq_len,
     const int batch_size,
     const int num_heads,
+    const int num_kv_heads,
     const float sm_scale)
 {
     const int batch_head_idx = blockIdx.x;
     const int batch_idx = batch_head_idx / num_heads;
     const int head_idx = batch_head_idx % num_heads;
+    const int kv_head_idx = head_idx / (num_heads / num_kv_heads);
     const int tid = threadIdx.x;
     
     const int bhd_offset = (batch_idx * num_heads + head_idx) * seq_len * HEAD_DIM;
+    const int kv_bhd_offset = (batch_idx * num_kv_heads + kv_head_idx) * seq_len * HEAD_DIM;
     const half* q_ptr = Q + bhd_offset;
-    const half* k_ptr = K + bhd_offset;
-    const half* v_ptr = V + bhd_offset;
+    const half* k_ptr = K + kv_bhd_offset;
+    const half* v_ptr = V + kv_bhd_offset;
     half* o_ptr = O + bhd_offset;
     
     // Shared memory for entire sequence
@@ -422,6 +428,7 @@ sdpa_kernel_fp32(
     const int head_dim,
     const int batch_size,
     const int num_heads,
+    const int num_kv_heads,
     const float sm_scale)
 {
     const int batch_head_idx = blockIdx.y;
@@ -431,11 +438,13 @@ sdpa_kernel_fp32(
     
     const int batch_idx = batch_head_idx / num_heads;
     const int head_idx = batch_head_idx % num_heads;
+    const int kv_head_idx = head_idx / (num_heads / num_kv_heads);
     
     const int bhd_offset = (batch_idx * num_heads + head_idx) * seq_len * head_dim;
+    const int kv_bhd_offset = (batch_idx * num_kv_heads + kv_head_idx) * seq_len * head_dim;
     const float* q_ptr = Q + bhd_offset + query_idx * head_dim;
-    const float* k_ptr = K + bhd_offset;
-    const float* v_ptr = V + bhd_offset;
+    const float* k_ptr = K + kv_bhd_offset;
+    const float* v_ptr = V + kv_bhd_offset;
     float* o_ptr = O + bhd_offset + query_idx * head_dim;
     
     // Compute attention scores
@@ -501,6 +510,7 @@ torch::Tensor fast_short_seq_attn(
     const int num_heads = q.size(1);
     const int seq_len = q.size(2);
     const int head_dim = q.size(3);
+    const int num_kv_heads = k.size(1);
     
     auto output = torch::empty_like(q);
     
@@ -520,14 +530,14 @@ torch::Tensor fast_short_seq_attn(
                     reinterpret_cast<const half*>(k.data_ptr<at::Half>()),
                     reinterpret_cast<const half*>(v.data_ptr<at::Half>()),
                     reinterpret_cast<half*>(output.data_ptr<at::Half>()),
-                    seq_len, batch_size, num_heads, static_cast<float>(sm_scale));
+                    seq_len, batch_size, num_heads, num_kv_heads, static_cast<float>(sm_scale));
             } else {
                 sdpa_small_seq_kernel_fp16<128, 64, false><<<grid, block, smem>>>(
                     reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
                     reinterpret_cast<const half*>(k.data_ptr<at::Half>()),
                     reinterpret_cast<const half*>(v.data_ptr<at::Half>()),
                     reinterpret_cast<half*>(output.data_ptr<at::Half>()),
-                    seq_len, batch_size, num_heads, static_cast<float>(sm_scale));
+                    seq_len, batch_size, num_heads, num_kv_heads, static_cast<float>(sm_scale));
             }
         } else {
             // General tiled kernel
@@ -546,14 +556,14 @@ torch::Tensor fast_short_seq_attn(
                         reinterpret_cast<const half*>(k.data_ptr<at::Half>()),
                         reinterpret_cast<const half*>(v.data_ptr<at::Half>()),
                         reinterpret_cast<half*>(output.data_ptr<at::Half>()),
-                        seq_len, batch_size, num_heads, static_cast<float>(sm_scale));
+                        seq_len, batch_size, num_heads, num_kv_heads, static_cast<float>(sm_scale));
                 } else {
                     sdpa_kernel_fp16<64, false><<<grid, block, smem>>>(
                         reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
                         reinterpret_cast<const half*>(k.data_ptr<at::Half>()),
                         reinterpret_cast<const half*>(v.data_ptr<at::Half>()),
                         reinterpret_cast<half*>(output.data_ptr<at::Half>()),
-                        seq_len, batch_size, num_heads, static_cast<float>(sm_scale));
+                        seq_len, batch_size, num_heads, num_kv_heads, static_cast<float>(sm_scale));
                 }
             } else if (head_dim == 128) {
                 if (is_causal) {
@@ -562,14 +572,14 @@ torch::Tensor fast_short_seq_attn(
                         reinterpret_cast<const half*>(k.data_ptr<at::Half>()),
                         reinterpret_cast<const half*>(v.data_ptr<at::Half>()),
                         reinterpret_cast<half*>(output.data_ptr<at::Half>()),
-                        seq_len, batch_size, num_heads, static_cast<float>(sm_scale));
+                        seq_len, batch_size, num_heads, num_kv_heads, static_cast<float>(sm_scale));
                 } else {
                     sdpa_kernel_fp16<128, false><<<grid, block, smem>>>(
                         reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
                         reinterpret_cast<const half*>(k.data_ptr<at::Half>()),
                         reinterpret_cast<const half*>(v.data_ptr<at::Half>()),
                         reinterpret_cast<half*>(output.data_ptr<at::Half>()),
-                        seq_len, batch_size, num_heads, static_cast<float>(sm_scale));
+                        seq_len, batch_size, num_heads, num_kv_heads, static_cast<float>(sm_scale));
                 }
             }
         }
@@ -589,14 +599,14 @@ torch::Tensor fast_short_seq_attn(
                 k.data_ptr<float>(),
                 v.data_ptr<float>(),
                 output.data_ptr<float>(),
-                seq_len, head_dim, batch_size, num_heads, static_cast<float>(sm_scale));
+                seq_len, head_dim, batch_size, num_heads, num_kv_heads, static_cast<float>(sm_scale));
         } else {
             sdpa_kernel_fp32<false><<<grid, block, smem>>>(
                 q.data_ptr<float>(),
                 k.data_ptr<float>(),
                 v.data_ptr<float>(),
                 output.data_ptr<float>(),
-                seq_len, head_dim, batch_size, num_heads, static_cast<float>(sm_scale));
+                seq_len, head_dim, batch_size, num_heads, num_kv_heads, static_cast<float>(sm_scale));
         }
     }
     

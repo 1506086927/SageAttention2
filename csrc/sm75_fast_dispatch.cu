@@ -40,11 +40,20 @@ fast_attn_kernel_half2(
     const half* __restrict__ V,
     half* __restrict__ O,
     int N,
-    float scale)
+    float scale,
+    int num_heads,
+    int num_kv_heads)
 {
-    const int bh = blockIdx.x;  // batch * H + head
+    const int bh = blockIdx.x;  // batch * num_heads + head
+    const int batch_idx = bh / num_heads;
+    const int head_idx = bh % num_heads;
+    const int kv_head_idx = head_idx / (num_heads / num_kv_heads);
+    const int b_kv_h = batch_idx * num_kv_heads + kv_head_idx;
+    
     const int tid = threadIdx.x;
+    
     const int base_offset = bh * N * D;
+    const int kv_base_offset = b_kv_h * N * D;
 
     // Shared memory layout: [Q, K, V, scores]
     extern __shared__ char smem_raw[];
@@ -65,11 +74,12 @@ fast_attn_kernel_half2(
         int base_idx = idx * 2;
         int r = base_idx / D;
         int d = base_idx % D;
-        int offset = bh * N * D + r * D + d;
+        int offset_q = base_offset + r * D + d;
+        int offset_kv = kv_base_offset + r * D + d;
 
-        reinterpret_cast<half2*>(&smem_q[r * D + d])[0] = reinterpret_cast<const half2*>(&Q[offset])[0];
-        reinterpret_cast<half2*>(&smem_k[r * D + d])[0] = reinterpret_cast<const half2*>(&K[offset])[0];
-        reinterpret_cast<half2*>(&smem_v[r * D + d])[0] = reinterpret_cast<const half2*>(&V[offset])[0];
+        reinterpret_cast<half2*>(&smem_q[r * D + d])[0] = reinterpret_cast<const half2*>(&Q[offset_q])[0];
+        reinterpret_cast<half2*>(&smem_k[r * D + d])[0] = reinterpret_cast<const half2*>(&K[offset_kv])[0];
+        reinterpret_cast<half2*>(&smem_v[r * D + d])[0] = reinterpret_cast<const half2*>(&V[offset_kv])[0];
     }
     __syncthreads();
 
@@ -82,7 +92,7 @@ fast_attn_kernel_half2(
 
         #pragma unroll
         for (int j = 0; j < N; ++j) {
-            if (IS_CAUSAL && j > i) {
+            if ((IS_CAUSAL && j > i) || (j >= N) || (i >= N)) {
                 smem_s[i * N + j] = -1e20f;
                 continue;
             }
@@ -152,6 +162,7 @@ at::Tensor sm75_custom_short_sdpa(
     const int num_heads = q.size(1);
     const int seq_len = q.size(2);
     const int head_dim = q.size(3);
+    const int num_kv_heads = k.size(1);
 
     auto output = torch::empty_like(q);
 
@@ -176,7 +187,7 @@ at::Tensor sm75_custom_short_sdpa(
 
     #define LAUNCH_CUSTOM_KERNEL(D, causal) \
         fast_attn_kernel_half2<D, causal><<<total_bh, threads, smem_size, stream>>>( \
-            q_ptr, k_ptr, v_ptr, o_ptr, seq_len, sm_scale)
+            q_ptr, k_ptr, v_ptr, o_ptr, seq_len, sm_scale, num_heads, num_kv_heads)
 
     if (head_dim == 64) {
         if (is_causal) {
@@ -204,25 +215,3 @@ at::Tensor sm75_custom_short_sdpa(
 
     return output;
 }
-
-/*
- * Fast SDPA for SM75 with tiered dispatch in C++.
- *
- * This function is designed for ComfyUI's most common cases:
- * - SD text encoding (seq=77, MHA, HND layout)
- * - Short self-attention (seq < 256, MHA)
- * - Short cross-attention (seq_q < 256, MHA)
- *
- * For seq <= 128: Uses custom CUDA kernel to beat PyTorch
- * For seq < 256: Calls PyTorch's Flash Attention directly from C++
- *
- * Args:
- *   q: Query tensor, shape (batch, heads, seq_q, dim), dtype=float16, layout=HND
- *   k: Key tensor, shape (batch, heads, seq_kv, dim), dtype=float16, layout=HND
- *   v: Value tensor, same shape as k
- *   is_causal: Whether to apply causal mask
- *   sm_scale: Softmax scale (0.0 = auto = 1/sqrt(dim))
- *
- * Returns:
- *   Output tensor, same shape and dtype as q
- */

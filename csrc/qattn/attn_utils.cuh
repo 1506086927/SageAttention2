@@ -127,7 +127,8 @@ __device__ __forceinline__ void load_global_to_share(T **lane_ptr, uint32_t &sme
 #pragma unroll
     for (uint32_t j = 0; j < smem_iters_row; j++)
     {
-      smem.load_128b_async<cp_async::SharedMemFillMode::kNoFill>(smem_offset, *lane_ptr, base_idx < max_len);
+      // 关键修复：改为 kFillZero，确保越界加载部分完全填充为 0
+      smem.load_128b_async<cp_async::SharedMemFillMode::kFillZero>(smem_offset, *lane_ptr, base_idx < max_len);
       *lane_ptr += (global_to_shared_line_lanes * pack_size);
       smem_offset = smem.advance_offset_by_column<global_to_shared_line_lanes>(smem_offset);
     }
@@ -892,4 +893,3 @@ __device__ __forceinline__ void compute_fp8_sv_inst_buf(const smem_t<swizzle_mod
     }
   }
 }
-
