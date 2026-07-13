@@ -63,19 +63,24 @@ def get_nvcc_cuda_version(cuda_dir: str) -> Version:
     return nvcc_cuda_version
 
 compute_capabilities = set()
-device_count = torch.cuda.device_count()
-for i in range(device_count):
-    major, minor = torch.cuda.get_device_capability(i)
-    if major < 7:
-        warnings.warn(f"skipping GPU {i} with compute capability {major}.{minor}")
-        continue
-    compute_capabilities.add(f"{major}.{minor}")
 
-nvcc_cuda_version = get_nvcc_cuda_version(CUDA_HOME)
+if torch.cuda.is_available():
+    device_count = torch.cuda.device_count()
+    for i in range(device_count):
+        major, minor = torch.cuda.get_device_capability(i)
+        if major < 7:
+            warnings.warn(f"skipping GPU {i} with compute capability {major}.{minor}")
+            continue
+        compute_capabilities.add(f"{major}.{minor}")
+
 if not compute_capabilities:
-    raise RuntimeError("No GPUs found. Please specify the target GPU architectures or build on a machine with GPUs.")
+    # P1-5: allow build in CI/Docker without GPUs; default to Turing.
+    compute_capabilities = {"7.5"}
+    print("No GPUs found. Falling back to compute 7.5 for build.")
 else:
     print(f"Detect GPUs with compute capabilities: {compute_capabilities}")
+
+nvcc_cuda_version = get_nvcc_cuda_version(CUDA_HOME)
 
 for capability in compute_capabilities:
     if capability.startswith("8.0"):
@@ -130,20 +135,7 @@ if HAS_SM89 or HAS_SM120:
     )
     ext_modules.append(qattn_extension)
 
-if HAS_SM90:
-    qattn_extension = CUDAExtension(
-        name="sageattention._qattn_sm90",
-        sources=[
-            "csrc/qattn/pybind_sm90.cpp",
-            "csrc/qattn/qk_int_sv_f8_cuda_sm90.cu",
-        ],
-        extra_compile_args={
-            "cxx": CXX_FLAGS,
-            "nvcc": NVCC_FLAGS,
-        },
-        extra_link_args=['-lcuda'],
-    )
-    ext_modules.append(qattn_extension)
+# SM90 moved to csrc/experimental/sm90; not compiled by default.
 
 fused_extension = CUDAExtension(
     name="sageattention._fused",
@@ -156,21 +148,6 @@ fused_extension = CUDAExtension(
 ext_modules.append(fused_extension)
 
 if HAS_SM75:
-    fast_attn_sources = ["csrc/fast_attn_sm75.cu", "csrc/fast_attn_sm75_bind.cpp"]
-else:
-    fast_attn_sources = ["csrc/fast_attn.cpp"]
-    
-fast_attn_extension = CUDAExtension(
-    name="sageattention._fast_attn",
-    sources=fast_attn_sources,
-    extra_compile_args={
-        "cxx": CXX_FLAGS,
-        "nvcc": NVCC_FLAGS if HAS_SM75 else [],
-    },
-)
-ext_modules.append(fast_attn_extension)
-
-if HAS_SM75:
     sm75_fast_dispatch_extension = CUDAExtension(
         name="sageattention._sm75_fast_dispatch",
         sources=["csrc/sm75_fast_dispatch.cu", "csrc/sm75_fast_dispatch_bind.cpp"],
@@ -180,6 +157,17 @@ if HAS_SM75:
         },
     )
     ext_modules.append(sm75_fast_dispatch_extension)
+
+if HAS_SM75:
+    sm75_short_sdpa_v2_extension = CUDAExtension(
+        name="sageattention._sm75_short_sdpa_v2",
+        sources=["csrc/sm75/short_sdpa_v2.cu", "csrc/sm75/short_sdpa_v2_bind.cpp"],
+        extra_compile_args={
+            "cxx": CXX_FLAGS,
+            "nvcc": NVCC_FLAGS,
+        },
+    )
+    ext_modules.append(sm75_short_sdpa_v2_extension)
 
 setup(
     name='sageattention', 

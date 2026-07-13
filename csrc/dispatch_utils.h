@@ -102,10 +102,18 @@
     TORCH_CHECK(false, oss.str());                                                      \
   }
 
+// P1-6: Separate device-side capability from host-side dispatch.
+// - On device (__CUDA_ARCH__ defined): choose based on actual compute capability.
+// - On host (dispatch functions): always allow BF16; let device-side kernels enforce real constraints.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
   #define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16 DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16_FULL
-#else
+#elif defined(__CUDA_ARCH__)
+  // Device code on < SM80: restrict to FP16/FP32 only.
   #define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16 DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16_RESTRICTED
+#else
+  // Host-side dispatch: allow BF16 (FULL). Actual capability should be checked at runtime
+  // via at::cuda::getCurrentDeviceProperties(), not via __CUDA_ARCH__.
+  #define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16 DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16_FULL
 #endif
 
 // Macro for FP8 kernels that only support Half/BFloat16 (not Float32)
