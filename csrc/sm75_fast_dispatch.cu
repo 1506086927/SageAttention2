@@ -13,8 +13,7 @@
  *     out = _sm75_fast_dispatch.sm75_fast_sdpa(q, k, v, is_causal, sm_scale)
  */
 
-#include <torch/types.h>
-
+#include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -158,11 +157,21 @@ at::Tensor sm75_custom_short_sdpa(
     bool is_causal,
     float sm_scale)
 {
+    // P0-A-4: 短核入口防御性检查
+    TORCH_CHECK(q.scalar_type() == at::kHalf, "sm75_fast_dispatch requires fp16 q, got ", q.scalar_type());
+    TORCH_CHECK(k.scalar_type() == at::kHalf, "sm75_fast_dispatch requires fp16 k, got ", k.scalar_type());
+    TORCH_CHECK(v.scalar_type() == at::kHalf, "sm75_fast_dispatch requires fp16 v, got ", v.scalar_type());
+    TORCH_CHECK(q.is_contiguous(), "q must be contiguous for sm75 short kernel");
+    TORCH_CHECK(k.is_contiguous(), "k must be contiguous for sm75 short kernel");
+    TORCH_CHECK(v.is_contiguous(), "v must be contiguous for sm75 short kernel");
+
     const int batch_size = q.size(0);
     const int num_heads = q.size(1);
     const int seq_len = q.size(2);
     const int head_dim = q.size(3);
     const int num_kv_heads = k.size(1);
+
+    TORCH_CHECK(num_heads % num_kv_heads == 0, "q_heads must be a multiple of kv_heads (GQA/MQA), got ", num_heads, " and ", num_kv_heads);
 
     auto output = torch::empty_like(q);
 
@@ -175,8 +184,8 @@ at::Tensor sm75_custom_short_sdpa(
     size_t score_size = seq_len * seq_len * sizeof(float);
     size_t smem_size = qkv_size + score_size;
 
-    // Check shared memory limit (48KB is typical for SM75)
-    if (smem_size > 48 * 1024) {
+    // Check shared memory limit (64KB is max for SM75 block)
+    if (smem_size > 64 * 1024) {
         return at::Tensor();  // Return empty tensor to signal fallback
     }
 
@@ -186,6 +195,7 @@ at::Tensor sm75_custom_short_sdpa(
     half* o_ptr = reinterpret_cast<half*>(output.data_ptr<at::Half>());
 
     #define LAUNCH_CUSTOM_KERNEL(D, causal) \
+        cudaFuncSetAttribute(fast_attn_kernel_half2<D, causal>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size); \
         fast_attn_kernel_half2<D, causal><<<total_bh, threads, smem_size, stream>>>( \
             q_ptr, k_ptr, v_ptr, o_ptr, seq_len, sm_scale, num_heads, num_kv_heads)
 

@@ -29,19 +29,19 @@ from .triton.quant_per_thread import per_thread_int8 as per_thread_int8_triton
 try:
     from . import _qattn_sm80
     SM80_ENABLED = True
-except:
+except (ImportError, OSError):
     SM80_ENABLED = False
 
 try:
     from . import _qattn_sm89
     SM89_ENABLED = True
-except:
+except (ImportError, OSError):
     SM89_ENABLED = False
 
 try:
     from . import _qattn_sm90
     SM90_ENABLED = True
-except:
+except (ImportError, OSError):
     SM90_ENABLED = False
 
 from .quant import per_block_int8 as per_block_int8_cuda
@@ -52,6 +52,9 @@ from .quant import per_channel_fp8
 from typing import Any, List, Literal, Optional, Tuple, Union
 import os
 import warnings
+
+# 引入重构后的形状处理工具函数
+from .utils.shape import pad_head_dim, ensure_lastdim_contiguous, compute_lse_correction
 
 # --- Performance & Robustness: Device capability cache ---
 _device_sm_cache = {}
@@ -100,11 +103,10 @@ def sageattn(
 
     _set_device_if_needed(v.device)
 
-    # 统一确保物理内存连续，解决 C++ 量化核基于 float4 128-bit 向量化加载越界的问题
-    # 不强制篡改张量形状，保留外界期待的 tensor_layout 返回值
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
+    # 统一确保最后一维物理内存连续，解决 C++ 量化核基于 float4 128-bit 向量化加载越界的问题
+    q = ensure_lastdim_contiguous(q)
+    k = ensure_lastdim_contiguous(k)
+    v = ensure_lastdim_contiguous(v)
 
     major, minor = _get_device_sm(q.device)
     arch = f"sm{major}{minor}"
@@ -120,54 +122,56 @@ def sageattn(
         k = k.to(torch.float16)
         v = v.to(torch.float16)
 
-    seq_len = q.size(2) if tensor_layout == "HND" else q.size(1)
+    from .specs import AttentionSpec
+    from .dispatch import select_backend
+    spec = AttentionSpec.from_tensors(q, k, v, tensor_layout, is_causal, return_lse, arch)
+    backend = select_backend(spec)
 
-    if arch == "sm86" or is_sm75:
-        if is_sm75:
-            # 对于长序列，回退到 CUDA 量化核心（原生支持 stride NHD）
-            if seq_len >= 1024 or return_lse:
-                result = sageattn_qk_int8_pv_fp16_cuda(
-                    q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, 
-                    qk_quant_gran="per_warp", sm_scale=sm_scale, 
-                    return_lse=return_lse, pv_accum_dtype="fp32"
-                )
-                if return_lse:
-                    o, lse = result
-                    return o.to(orig_dtype), lse
-                return result.to(orig_dtype)
-            else:
-                from . import _sm75_fast_dispatch
-                is_nhd = (tensor_layout == "NHD")
-                
-                # 隔离内存操作：仅在送入假定 HND 物理布局的 C++ 核心前转置并强制连续
-                if is_nhd:
-                    q_tmp = q.transpose(1, 2).contiguous()
-                    k_tmp = k.transpose(1, 2).contiguous()
-                    v_tmp = v.transpose(1, 2).contiguous()
-                else:
-                    q_tmp = q
-                    k_tmp = k
-                    v_tmp = v
+    # SM75 short path (via backends/sm75_short.py: v2 -> v1 -> torch sdpa fallback)
+    if backend == "sm75_short":
+        from .backends import sm75_short
+        result = sm75_short.sm75_short_sdpa(q, k, v, is_causal, sm_scale, tensor_layout)
+        return result.to(orig_dtype)
 
-                result = _sm75_fast_dispatch.sm75_fast_sdpa(
-                    q_tmp, k_tmp, v_tmp, is_causal, sm_scale if sm_scale is not None else 0.0
-                )
+    # SM75 long path (qattn CUDA kernel)
+    if backend == "sm75_qattn_long":
+        result = sageattn_qk_int8_pv_fp16_cuda(
+            q, k, v, tensor_layout=tensor_layout, is_causal=is_causal,
+            qk_quant_gran="per_warp", sm_scale=sm_scale,
+            return_lse=return_lse, pv_accum_dtype="fp32"
+        )
+        if return_lse:
+            o, lse = result
+            return o.to(orig_dtype), lse
+        return result.to(orig_dtype)
 
-                # 将结果转置回期望的 NHD 格式
-                if is_nhd:
-                    result = result.transpose(1, 2).contiguous()
-                
-                return result.to(orig_dtype)
-        else:
-            return sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32")
+    # Non-SM75 backends (existing behavior, now routed via dispatch for clarity)
+    if arch == "sm86":
+        return sageattn_qk_int8_pv_fp16_cuda(
+            q, k, v, tensor_layout=tensor_layout, is_causal=is_causal,
+            sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32"
+        )
     elif arch == "sm80":
-        return sageattn_qk_int8_pv_fp16_triton(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse)
+        return sageattn_qk_int8_pv_fp16_triton(
+            q, k, v, tensor_layout=tensor_layout, is_causal=is_causal,
+            sm_scale=sm_scale, return_lse=return_lse
+        )
     elif arch == "sm89":
-        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp32")
+        return sageattn_qk_int8_pv_fp8_cuda(
+            q, k, v, tensor_layout=tensor_layout, is_causal=is_causal,
+            sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp32"
+        )
     elif arch == "sm90":
-        return sageattn_qk_int8_pv_fp8_cuda_sm90(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp32")
+        return sageattn_qk_int8_pv_fp8_cuda_sm90(
+            q, k, v, tensor_layout=tensor_layout, is_causal=is_causal,
+            sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32+fp32"
+        )
     elif arch == "sm120":
-        return sageattn_qk_int8_pv_fp8_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, qk_quant_gran="per_warp", sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32")
+        return sageattn_qk_int8_pv_fp8_cuda(
+            q, k, v, tensor_layout=tensor_layout, is_causal=is_causal,
+            qk_quant_gran="per_warp", sm_scale=sm_scale,
+            return_lse=return_lse, pv_accum_dtype="fp32"
+        )
     else:
         raise ValueError(f"Unsupported CUDA architecture: {arch}")
 
@@ -199,31 +203,16 @@ def sageattn_qk_int8_pv_fp16_triton(
         dtype = torch.float16
 
     head_dim_og = q.size(-1)
-
-    if head_dim_og < 64:
-        q = torch.nn.functional.pad(q, (0, 64 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 64 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 64 - head_dim_og))
-    elif head_dim_og > 64 and head_dim_og < 128:
-        q = torch.nn.functional.pad(q, (0, 128 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 128 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 128 - head_dim_og))
-    elif head_dim_og > 128 and head_dim_og <= 256:
-        q = torch.nn.functional.pad(q, (0, 256 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 256 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 256 - head_dim_og))
-    elif head_dim_og > 256:
-        raise ValueError(f"Unsupported head_dim: {head_dim_og}")
+    q = pad_head_dim(q, head_dim_og)
+    k = pad_head_dim(k, head_dim_og)
+    v = pad_head_dim(v, head_dim_og)
 
     seq_dim = 1 if tensor_layout == "NHD" else 2
 
     if smooth_k:
         km = k.mean(dim=seq_dim, keepdim=True)
         if return_lse:
-            if tensor_layout == "NHD":
-                lse_correction = torch.matmul(q.transpose(1, 2), km.transpose(1, 2).transpose(2, 3)).squeeze(-1).to(torch.float32)
-            else:
-                lse_correction = torch.matmul(q, km.transpose(2, 3)).squeeze(-1).to(torch.float32)
+            lse_correction = compute_lse_correction(q, km, tensor_layout)
     else:
         km = None
 
@@ -275,21 +264,9 @@ def sageattn_varlen(
     torch.cuda.set_device(v.device)
 
     head_dim_og = q.size(-1)
-
-    if head_dim_og < 64:
-        q = torch.nn.functional.pad(q, (0, 64 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 64 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 64 - head_dim_og))
-    elif head_dim_og > 64 and head_dim_og < 128:
-        q = torch.nn.functional.pad(q, (0, 128 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 128 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 128 - head_dim_og))
-    elif head_dim_og > 128 and head_dim_og <= 256:
-        q = torch.nn.functional.pad(q, (0, 256 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 256 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 256 - head_dim_og))
-    elif head_dim_og > 256:
-        raise ValueError(f"Unsupported head_dim: {head_dim_og}")
+    q = pad_head_dim(q, head_dim_og)
+    k = pad_head_dim(k, head_dim_og)
+    v = pad_head_dim(v, head_dim_og)
 
     assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, "Last dim of qkv must be contiguous."
     assert cu_seqlens_q.is_contiguous() and cu_seqlens_k.is_contiguous(), "cu_seqlens_q and cu_seqlens_k must be contiguous."
@@ -348,7 +325,7 @@ def sageattn_qk_int8_pv_fp16_cuda(
     v: torch.Tensor,
     tensor_layout: str = "HND",
     is_causal: bool = False,
-    qk_quant_gran: str = "per_thread",
+    qk_quant_gran: str = "per_warp",
     sm_scale: Optional[float] = None,
     pv_accum_dtype: str = "fp32",
     smooth_k: bool = True,
@@ -376,7 +353,7 @@ def sageattn_qk_int8_pv_fp16_cuda(
         v = v.to(torch.float16)
 
     _tensor_layout = 0 if tensor_layout == "NHD" else 1
-    _is_caual = 1 if is_causal else 0
+    _is_causal = 1 if is_causal else 0
     _qk_quant_gran = 3 if qk_quant_gran == "per_thread" else 2 # Default mapped
     if qk_quant_gran == "per_block":
         _qk_quant_gran = 2 
@@ -385,21 +362,9 @@ def sageattn_qk_int8_pv_fp16_cuda(
     _return_lse = 1 if return_lse else 0
 
     head_dim_og = q.size(-1)
-
-    if head_dim_og < 64:
-        q = torch.nn.functional.pad(q, (0, 64 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 64 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 64 - head_dim_og))
-    elif head_dim_og > 64 and head_dim_og < 128:
-        q = torch.nn.functional.pad(q, (0, 128 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 128 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 128 - head_dim_og))
-    elif head_dim_og > 128 and head_dim_og <= 256:
-        q = torch.nn.functional.pad(q, (0, 256 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 256 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 256 - head_dim_og))
-    elif head_dim_og > 256:
-        raise ValueError(f"Unsupported head_dim: {head_dim_og}")
+    q = pad_head_dim(q, head_dim_og)
+    k = pad_head_dim(k, head_dim_og)
+    v = pad_head_dim(v, head_dim_og)
 
     if sm_scale is None:
         sm_scale = head_dim_og**-0.5
@@ -415,44 +380,26 @@ def sageattn_qk_int8_pv_fp16_cuda(
         lse_correction_needed = False
 
     original_q_seq_len = q.size(seq_dim) if is_sm75 else None
+    original_kv_seq_len = k.size(seq_dim) if is_sm75 else None
 
-    # Padding logic for SM75
+    # Padding logic for SM75: Q维pad保留以对齐CTA_Q，KV维pad删除以避免softmax分母污染
     if is_sm75:
         q_len = q.size(seq_dim)
-        kv_len = k.size(seq_dim)
+        # q_seq_pad用于Q的CTA_Q对齐，pad出的Q行后续会被裁剪，不影响KV侧的softmax归一化
         q_seq_pad = (64 - (q_len % 64)) % 64
-        k_seq_pad = (32 - (kv_len % 32)) % 32
 
-        if q_seq_pad > 0 or k_seq_pad > 0:
+        if q_seq_pad > 0:
             if _tensor_layout == 0: 
-                if q_seq_pad > 0:
-                    q = torch.nn.functional.pad(q, (0, 0, 0, 0, 0, q_seq_pad))
-                if k_seq_pad > 0:
-                    k = torch.nn.functional.pad(k, (0, 0, 0, 0, 0, k_seq_pad))
-                    v = torch.nn.functional.pad(v, (0, 0, 0, 0, 0, k_seq_pad))
+                q = torch.nn.functional.pad(q, (0, 0, 0, 0, 0, q_seq_pad))
             else: 
-                if q_seq_pad > 0:
-                    q = torch.nn.functional.pad(q, (0, 0, 0, q_seq_pad, 0, 0))
-                if k_seq_pad > 0:
-                    k = torch.nn.functional.pad(k, (0, 0, 0, k_seq_pad, 0, 0))
-                    v = torch.nn.functional.pad(v, (0, 0, 0, k_seq_pad, 0, 0))
+                q = torch.nn.functional.pad(q, (0, 0, 0, q_seq_pad, 0, 0))
+        
+        # KV序列维的pad已删除：底层CUDA kernel已通过apply_out_of_bound_mask正确处理tail block
 
     lse_correction = None
     if lse_correction_needed and smooth_k and km is not None:
         try:
-            h_qo = q.size(1) if _tensor_layout == 1 else q.size(2)
-            h_kv = km.size(1) if _tensor_layout == 1 else km.size(2)
-            num_kv_groups = h_qo // h_kv if h_kv > 0 else 1
-            
-            if num_kv_groups > 1:
-                km_for_correction = km.repeat_interleave(num_kv_groups, dim=1) if _tensor_layout == 1 else km.repeat_interleave(num_kv_groups, dim=2)
-            else:
-                km_for_correction = km
-            
-            if tensor_layout == "NHD":
-                lse_correction = torch.matmul(q.transpose(1, 2), km_for_correction.transpose(1, 2).transpose(2, 3)).squeeze(-1).to(torch.float32)
-            else:
-                lse_correction = torch.matmul(q, km_for_correction.transpose(2, 3)).squeeze(-1).to(torch.float32)
+            lse_correction = compute_lse_correction(q, km, tensor_layout)
         except Exception as e:
             warnings.warn(f"Skipping lse_correction due to: {e}")
             lse_correction = None
@@ -497,15 +444,15 @@ def sageattn_qk_int8_pv_fp16_cuda(
         smooth_v = False
 
     if _pv_accum_dtype == 'fp32':
-        lse = _qattn_sm80.qk_int8_sv_f16_accum_f32_attn(q_int8, k_int8, v, o, q_scale, k_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+        lse = _qattn_sm80.qk_int8_sv_f16_accum_f32_attn(q_int8, k_int8, v, o, q_scale, k_scale, _tensor_layout, _is_causal, _qk_quant_gran, sm_scale, _return_lse)
     elif _pv_accum_dtype == "fp16":
         if smooth_v:
             smoothed_v, vm = sub_mean(v, tensor_layout=tensor_layout)
-            lse = _qattn_sm80.qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(q_int8, k_int8, smoothed_v, o, q_scale, k_scale, vm, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+            lse = _qattn_sm80.qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(q_int8, k_int8, smoothed_v, o, q_scale, k_scale, vm, _tensor_layout, _is_causal, _qk_quant_gran, sm_scale, _return_lse)
         else:
-            lse = _qattn_sm80.qk_int8_sv_f16_accum_f16_attn(q_int8, k_int8, v, o, q_scale, k_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+            lse = _qattn_sm80.qk_int8_sv_f16_accum_f16_attn(q_int8, k_int8, v, o, q_scale, k_scale, _tensor_layout, _is_causal, _qk_quant_gran, sm_scale, _return_lse)
     elif _pv_accum_dtype == "fp16+fp32":
-        lse = _qattn_sm80.qk_int8_sv_f16_accum_f16_attn_inst_buf(q_int8, k_int8, v, o, q_scale, k_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+        lse = _qattn_sm80.qk_int8_sv_f16_accum_f16_attn_inst_buf(q_int8, k_int8, v, o, q_scale, k_scale, _tensor_layout, _is_causal, _qk_quant_gran, sm_scale, _return_lse)
     else:
         raise ValueError(f"Unsupported pv_accum_dtype: {pv_accum_dtype}")
 
@@ -555,26 +502,14 @@ def sageattn_qk_int8_pv_fp8_cuda(
     _set_device_if_needed(v.device)
 
     _tensor_layout = 0 if tensor_layout == "NHD" else 1
-    _is_caual = 1 if is_causal else 0
+    _is_causal = 1 if is_causal else 0
     _qk_quant_gran = 3 if qk_quant_gran == "per_thread" else 2
     _return_lse = 1 if return_lse else 0
 
     head_dim_og = q.size(-1)
-
-    if head_dim_og < 64:
-        q = torch.nn.functional.pad(q, (0, 64 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 64 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 64 - head_dim_og))
-    elif head_dim_og > 64 and head_dim_og < 128:
-        q = torch.nn.functional.pad(q, (0, 128 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 128 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 128 - head_dim_og))
-    elif head_dim_og > 128 and head_dim_og <= 256:
-        q = torch.nn.functional.pad(q, (0, 256 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 256 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 256 - head_dim_og))
-    elif head_dim_og > 256:
-        raise ValueError(f"Unsupported head_dim: {head_dim_og}")
+    q = pad_head_dim(q, head_dim_og)
+    k = pad_head_dim(k, head_dim_og)
+    v = pad_head_dim(v, head_dim_og)
 
     assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, "Last dim of qkv must be contiguous."
 
@@ -586,10 +521,7 @@ def sageattn_qk_int8_pv_fp8_cuda(
     if smooth_k:
         km = k.mean(dim=seq_dim, keepdim=True)
         if return_lse:
-            if tensor_layout == "NHD":
-                lse_correction = torch.matmul(q.transpose(1, 2), km.transpose(1, 2).transpose(2, 3)).squeeze(-1).to(torch.float32)
-            else:
-                lse_correction = torch.matmul(q, km.transpose(2, 3)).squeeze(-1).to(torch.float32)
+            lse_correction = compute_lse_correction(q, km, tensor_layout)
     else:
         km = None
 
@@ -610,11 +542,11 @@ def sageattn_qk_int8_pv_fp8_cuda(
 
     if pv_accum_dtype == "fp32":
         if smooth_v:
-            lse = _qattn_sm89.qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, vm, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+            lse = _qattn_sm89.qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, vm, _tensor_layout, _is_causal, _qk_quant_gran, sm_scale, _return_lse)
         else:
-            lse = _qattn_sm89.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+            lse = _qattn_sm89.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_causal, _qk_quant_gran, sm_scale, _return_lse)
     elif pv_accum_dtype == "fp32+fp32":
-        lse = _qattn_sm89.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+        lse = _qattn_sm89.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_causal, _qk_quant_gran, sm_scale, _return_lse)
 
     o = o[..., :head_dim_og]
 
@@ -645,26 +577,14 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
     _set_device_if_needed(v.device)
 
     _tensor_layout = 0 if tensor_layout == "NHD" else 1
-    _is_caual = 1 if is_causal else 0
+    _is_causal = 1 if is_causal else 0
     _qk_quant_gran = 3 if qk_quant_gran == "per_thread" else 2
     _return_lse = 1 if return_lse else 0
 
     head_dim_og = q.size(-1)
-
-    if head_dim_og < 64:
-        q = torch.nn.functional.pad(q, (0, 64 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 64 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 64 - head_dim_og))
-    elif head_dim_og > 64 and head_dim_og < 128:
-        q = torch.nn.functional.pad(q, (0, 128 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 128 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 128 - head_dim_og))
-    elif head_dim_og > 128 and head_dim_og <= 256:
-        q = torch.nn.functional.pad(q, (0, 256 - head_dim_og))
-        k = torch.nn.functional.pad(k, (0, 256 - head_dim_og))
-        v = torch.nn.functional.pad(v, (0, 256 - head_dim_og))
-    elif head_dim_og > 256:
-        raise ValueError(f"Unsupported head_dim: {head_dim_og}")
+    q = pad_head_dim(q, head_dim_og)
+    k = pad_head_dim(k, head_dim_og)
+    v = pad_head_dim(v, head_dim_og)
 
     assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1, "Last dim of qkv must be contiguous."
 
@@ -676,10 +596,7 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
     if smooth_k:
         km = k.mean(dim=seq_dim, keepdim=True)
         if return_lse:
-            if tensor_layout == "NHD":
-                lse_correction = torch.matmul(q.transpose(1, 2), km.transpose(1, 2).transpose(2, 3)).squeeze(-1).to(torch.float32)
-            else:
-                lse_correction = torch.matmul(q, km.transpose(2, 3)).squeeze(-1).to(torch.float32)
+            lse_correction = compute_lse_correction(q, km, tensor_layout)
     else:
         km = None
 
@@ -705,7 +622,7 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
     if pv_accum_dtype == "fp32":
         raise NotImplementedError("Please use pv_accum_dtype='fp32+fp32' for sm90.")
     elif pv_accum_dtype == "fp32+fp32":
-        lse = _qattn_sm90.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+        lse = _qattn_sm90.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_causal, _qk_quant_gran, sm_scale, _return_lse)
 
     o = o[..., :head_dim_og]
 
