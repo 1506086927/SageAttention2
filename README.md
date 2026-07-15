@@ -1,3 +1,17 @@
+
+**对于 <= Torch 2.10 **：如果由于某些依赖限制你必须使用这个环境，那么手动去改一下** `python\Lib\site-packages\torch\include\torch\csrc\dynamo\compiled_autograd.h`  
+
+### 修改前（原代码）：
+    } else if constexpr (::std::is_same_v<T, ::std::string>) {
+      return at::StringType::get();
+    }
+
+### 修改后：
+    }/* else if constexpr (::std::is_same_v<T, ::std::string>) {
+      return at::StringType::get();
+    } */
+
+
 Sage attention hacked for NVIDIA Turing GPUs. See the real repo: https://github.com/thu-ml/SageAttention
 
 
